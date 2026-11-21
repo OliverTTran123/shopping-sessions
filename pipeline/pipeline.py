@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Shopping Sessions pipeline. rules.md wins over the starter skeleton.
 
-Cleaning (CSV dialect, dedup, validation, late events, linked-id names) is done
-here. DuckDB sessionizes, attributes, and aggregates.
+DuckDB reads the files as raw text and applies the CSV dialect, dedup and
+validation in SQL, then sessionizes, attributes, and aggregates. Linked-id names
+still come from a Python union-find.
 """
 
 import json
@@ -10,6 +11,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import duckdb
@@ -31,7 +33,6 @@ _F2 = re.compile(
     r"([+-])([0-9]{2}):([0-9]{2})$"
 )
 _F3 = re.compile(r"^[0-9]+$")
-_PRICE = re.compile(r"^[0-9]+$")
 _MONTH_DAYS = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 
 
@@ -87,45 +88,93 @@ def ts_to_ms(value: str | None) -> int | None:
     return None
 
 
-def price_value(raw: str | None) -> int | None:
-    if raw is None or _PRICE.fullmatch(raw) is None:
-        return None
-    number = int(raw)
-    if 1 <= number <= _PRICE_MAX:
-        return number
-    return None
+_BAD_TS = (
+    "2026-02-29T00:00:00Z",
+    "2026-10-03T24:00:00Z",
+    "2026-10-03T10:00:60Z",
+    "2026-10-03T10:00:00z",
+    "2026-10-03T10:00:00+24:00",
+    "2026-10-03T10:00:00+05:60",
+    "2026-10-03T10:00:00+0200",
+    "2026-13-03T10:00:00Z",
+    "2026-04-31T10:00:00Z",
+    "2026-10-03 10:00:00Z",
+    "2026-10-03T10:00:00",
+    "2026-10-03T10:00:00.5Z",
+    "2026-10-03T10:00:00Z\r",
+    "1791071890000.0",
+    "1.79e12",
+    "-5",
+    "9223372036854775808",
+    "١٧٩١٠٢١٦٠٠٠٠٠",
+    "２026-10-03T10:00:00Z",
+    "",
+)
+_GOOD_TS = (
+    "1970-01-01T00:00:00Z",
+    "1970-01-02T00:00:00Z",
+    "86400000",
+    "0",
+    "000",
+    "2026-10-03T23:58:10Z",
+    "2026-10-03T19:58:10-04:00",
+    "2026-10-04T11:58:10+12:00",
+    "0001791071890000",
+    "1791071890000",
+    "2026-10-03T10:00:00-00:00",
+    "2026-10-03T10:00:00+23:59",
+    "2028-02-29T00:00:00Z",
+    "2028-02-29T23:59:59-10:00",
+    "2024-12-31T23:59:59Z",
+    "2025-01-01T00:00:00Z",
+    "2027-03-01T00:00:00+00:00",
+    "2000-02-29T12:00:00Z",
+    "0000-01-01T00:00:00Z",
+    "9999-12-31T23:59:59Z",
+    "9223372036854775807",
+    "00009223372036854775807",
+)
+_PRICES = (
+    ("0250", 250),
+    ("1", 1),
+    ("10000000", _PRICE_MAX),
+    ("10000001", None),
+    ("0", None),
+    ("000", None),
+    ("", None),
+    ("12.5", None),
+    ("-5", None),
+    ("+5", None),
+    ("99999999999999999999999", None),
+    ("1000\r", None),
+    ("０250", None),
+    ("٢٥٠", None),
+)
 
 
-def self_check() -> None:
-    assert ts_to_ms("1970-01-01T00:00:00Z") == 0
+def sql_map(con: duckdb.DuckDBPyConnection, values: list[str], expr: str) -> list:
+    """expr applied to each value v, in order. Literals: binding a Python list is slow."""
+    literal = "[" + ", ".join("'" + value.replace("'", "''") + "'" for value in values) + "]"
+    return con.execute(f"SELECT list_transform({literal}, v -> {expr})").fetchone()[0]
+
+
+def self_check(con: duckdb.DuckDBPyConnection) -> None:
+    """The SQL macros must agree with the Python reference on every edge form."""
     assert ts_to_ms("1970-01-02T00:00:00Z") == _DAY_MS
-    assert ts_to_ms("86400000") == _DAY_MS
     same = ts_to_ms("2026-10-03T23:58:10Z")
     assert same == 1_791_071_890_000
     assert ts_to_ms("2026-10-03T19:58:10-04:00") == same
-    assert ts_to_ms("0001791071890000") == ts_to_ms("1791071890000")
-    assert ts_to_ms("2026-10-03T10:00:00-00:00") == ts_to_ms("2026-10-03T10:00:00Z")
-    assert ts_to_ms("2026-10-03T10:00:00+23:59") is not None
-    assert ts_to_ms("2028-02-29T00:00:00Z") is not None
-    for bad in (
-        "2026-02-29T00:00:00Z",
-        "2026-10-03T24:00:00Z",
-        "2026-10-03T10:00:60Z",
-        "2026-10-03T10:00:00z",
-        "2026-10-03T10:00:00+24:00",
-        "2026-10-03T10:00:00+05:60",
-        "2026-10-03T10:00:00+0200",
-        "1791071890000.0",
-        "١٧٩١٠٢١٦٠٠٠٠٠",
-        "２026-10-03T10:00:00Z",
-        "",
-    ):
+    for bad in _BAD_TS:
         assert ts_to_ms(bad) is None, bad
-    assert price_value("0250") == 250
-    assert price_value("10000000") == _PRICE_MAX
-    assert price_value("10000001") is None
-    assert price_value("０250") is None
-    assert price_value("٢٥٠") is None
+    samples = list(_GOOD_TS + _BAD_TS)
+    for value, sql_ms in zip(samples, sql_map(con, samples, "ts_ms(v)"), strict=True):
+        assert sql_ms == ts_to_ms(value), (value, sql_ms, ts_to_ms(value))
+    got = sql_map(con, [value for value, _ in _PRICES], "price_val(v)")
+    assert got == [want for _, want in _PRICES], got
+    fields = ["", '""', '"', '"a"', 'a"', '"a', '"a"b"', " a ", '" a "', "a", '"""']
+    got = sql_map(con, fields, "CASE WHEN fld_ok(v) THEN coalesce(fld(v), '<null>') END")
+    want = ["<null>", "<null>", None, "a", None, None, None, " a ", " a ", "a", None]
+    assert got == want, got
 
 
 def parse_fields(line: str, width: int) -> list[str | None] | None:
@@ -155,21 +204,6 @@ def data_lines(folder: Path) -> list[str]:
         parts = path.read_bytes().decode("utf-8").split("\n")
         lines.extend(line for line in parts[1:] if line != "")
     return lines
-
-
-def file_lines(path: Path) -> list[str]:
-    parts = path.read_bytes().decode("utf-8").split("\n")
-    return [line for line in parts[1:] if line != ""]
-
-
-def load_lookup(path: Path) -> dict[str, str]:
-    table: dict[str, str] = {}
-    for line in file_lines(path):
-        fields = parse_fields(line, 2)
-        if fields is None or fields[0] is None or fields[1] is None:
-            continue
-        table[fields[0]] = fields[1]
-    return table
 
 
 def person_names(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -204,64 +238,200 @@ def person_names(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
     return rows
 
 
-def surviving_events(
-    folder: Path, window_start: int, window_end: int
-) -> list[tuple[str, str, int, str, str, int | None]]:
-    # ingest_ms, ts_ms, user_id, event_type, product_id, price_raw
-    best: dict[
-        str, tuple[int | None, int | None, str | None, str | None, str | None, str | None]
-    ] = {}
-    for line in data_lines(folder):
-        fields = parse_fields(line, 7)
-        if fields is None or fields[0] is None:
-            continue
-        event_id, user_id, ts, ingest, event_type, product_id, price_raw = fields
-        ingest_ms = ts_to_ms(ingest)
-        current = (ingest_ms, ts_to_ms(ts), user_id, event_type, product_id, price_raw)
-        previous = best.get(event_id)
-        if previous is None or (
-            ingest_ms is not None and (previous[0] is None or ingest_ms < previous[0])
-        ):
-            best[event_id] = current
-    rows: list[tuple[str, str, int, str, str, int | None]] = []
-    for event_id, (ingest_ms, ts_ms, user_id, event_type, product_id, price_raw) in best.items():
-        if not user_id or ts_ms is None or ingest_ms is None or not product_id:
-            continue
-        if event_type not in ("view", "cart", "purchase"):
-            continue
-        if not (window_start <= ts_ms < window_end):
-            continue
-        if ingest_ms - ts_ms > _DAY_MS:
-            continue
-        price_cents = None
-        if event_type == "purchase":
-            price_cents = price_value(price_raw)
-            if price_cents is None:
-                continue
-        rows.append((event_id, user_id, ts_ms, event_type, product_id, price_cents))
-    return rows
+_CLOCK = (
+    "[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
+)
+# The CSV dialect and the three timestamp forms of rules.md, as SQL macros.
+_MACROS = (
+    # A quote is legal only as the first and last character of a whole field.
+    """
+    CREATE MACRO fld_ok(x) AS (
+        x IS NULL
+        OR NOT contains(x, '"')
+        OR (
+            length(x) >= 2 AND starts_with(x, '"') AND ends_with(x, '"')
+            AND NOT contains(substr(x, 2, length(x) - 2), '"')
+        )
+    )
+    """,
+    # Only for a field that passed fld_ok: a quote in it means it is wrapped in quotes.
+    """
+    CREATE MACRO fld(x) AS (
+        nullif(CASE WHEN contains(x, '"') THEN substr(x, 2, length(x) - 2) ELSE x END, '')
+    )
+    """,
+    # The patterns allow only ASCII digits and in-range clock fields; the cast then
+    # rejects impossible dates such as February 30. The cast ignores an offset, so
+    # F2 subtracts it by hand.
+    f"""
+    CREATE MACRO ts_ms(v) AS (
+        CASE
+        WHEN regexp_full_match(v, '{_CLOCK}Z') THEN epoch_ms(TRY_CAST(v AS TIMESTAMP))
+        WHEN regexp_full_match(v, '[0-9]+') THEN TRY_CAST(v AS BIGINT)
+        WHEN regexp_full_match(v, '{_CLOCK}[+-]([01][0-9]|2[0-3]):[0-5][0-9]') THEN
+            epoch_ms(TRY_CAST(v[1:19] AS TIMESTAMP))
+            - (CASE WHEN v[20:20] = '-' THEN -1 ELSE 1 END)
+              * (TRY_CAST(v[21:22] AS BIGINT) * 3600 + TRY_CAST(v[24:25] AS BIGINT) * 60)
+              * 1000
+        END
+    )
+    """,
+    f"""
+    CREATE MACRO price_val(v) AS (
+        CASE WHEN regexp_full_match(v, '[0-9]+')
+              AND TRY_CAST(v AS BIGINT) BETWEEN 1 AND {_PRICE_MAX}
+        THEN TRY_CAST(v AS BIGINT)
+        END
+    )
+    """,
+)
+_EVENT_HEADER = "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents"
+_CLICK_HEADER = "click_id,user_id,campaign_id,ts"
 
 
-def surviving_clicks(
-    folder: Path, click_start: int, window_end: int, campaigns: dict[str, str]
-) -> list[tuple[str, str, str, int]]:
-    first: dict[str, tuple[str | None, str | None, int | None]] = {}
-    for line in data_lines(folder):
-        fields = parse_fields(line, 4)
-        if fields is None or fields[0] is None:
-            continue
-        click_id, user_id, campaign_id, ts = fields
-        if click_id not in first:
-            first[click_id] = (user_id, campaign_id, ts_to_ms(ts))
-    rows: list[tuple[str, str, str, int]] = []
-    for click_id, (user_id, campaign_id, ts_ms) in first.items():
-        if not user_id or campaign_id is None or ts_ms is None:
-            continue
-        if campaign_id not in campaigns:
-            continue
-        if click_start <= ts_ms < window_end:
-            rows.append((click_id, user_id, campaign_id, ts_ms))
-    return rows
+def csv_files(folder: Path) -> list[Path]:
+    return sorted(folder.glob("*.csv"))
+
+
+def plain_headers(files: list[Path], header: str) -> bool:
+    want = header.encode() + b"\n"
+    for path in files:
+        with path.open("rb") as handle:
+            if handle.read(len(want)) != want:
+                return False
+    return True
+
+
+def parsed_sql(files: list[Path], header: str, fast: bool) -> str:
+    """Well-formed data lines of the files as unquoted, nullable fields named by header.
+
+    fast: read_csv splits lines and commas on all threads, with quoting off so the
+    fields arrive raw, and drops lines of the wrong width. It also ends a line at a
+    carriage return, which rules.md does not; in strict mode it raises on one instead.
+    Not fast: each file is split as text on newlines only, on one thread.
+    """
+    names = header.split(",")
+    raw = [f"f{i}" for i in range(len(names))]
+    cols = ", ".join(f"fld({field}) AS {name}" for field, name in zip(raw, names, strict=True))
+    ok = " AND ".join(f"fld_ok({field})" for field in raw)
+    paths = ", ".join("'" + str(path).replace("'", "''") + "'" for path in files)
+    if not files:
+        source = "SELECT " + ", ".join(f"NULL::VARCHAR AS {field}" for field in raw)
+        ok = "false"
+    elif fast:
+        columns = ", ".join(f"'{field}': 'VARCHAR'" for field in raw)
+        source = f"""
+            SELECT * FROM read_csv(
+                [{paths}], columns = {{{columns}}}, auto_detect = false,
+                delim = ',', quote = '', escape = '', new_line = '\\n',
+                header = false, skip = 1, strict_mode = true, ignore_errors = true
+            )
+        """
+    else:
+        fields = ", ".join(f"p[{i}] AS {field}" for i, field in enumerate(raw, 1))
+        source = f"""
+            SELECT {fields}
+            FROM (
+                SELECT string_split(line, ',') AS p
+                FROM (
+                    SELECT unnest(string_split(content, chr(10))[2:]) AS line
+                    FROM read_text([{paths}])
+                )
+            )
+            WHERE len(p) = {len(raw)}
+        """
+    return f"SELECT {cols} FROM ({source}) WHERE {ok}"
+
+
+def create_from_csv(
+    con: duckdb.DuckDBPyConnection, files: list[Path], header: str, statement: str
+) -> None:
+    """Run a statement whose {parsed} is the parsed lines, on the fast reader when it is exact."""
+    if plain_headers(files, header):
+        try:
+            con.execute(statement.format(parsed=parsed_sql(files, header, fast=True)))
+            return
+        except duckdb.InvalidInputException:
+            pass  # a carriage return in the data: only the text reader keeps it in its field
+    con.execute(statement.format(parsed=parsed_sql(files, header, fast=False)))
+
+
+def load_lookup(con: duckdb.DuckDBPyConnection, table: str, path: Path, key: str, val: str) -> None:
+    statement = f"""
+        CREATE TABLE {table} AS
+        SELECT {key}, min({val}) AS {val}
+        FROM ({{parsed}})
+        WHERE {key} IS NOT NULL AND {val} IS NOT NULL
+        GROUP BY {key}
+    """
+    create_from_csv(con, [path], f"{key},{val}", statement)
+
+
+def load_events(
+    con: duckdb.DuckDBPyConnection, files: list[Path], window_start: int, window_end: int
+) -> None:
+    # Dedup first: the copy with the smallest ingest_ts is kept even if it is invalid.
+    statement = f"""
+        CREATE TABLE events AS
+        SELECT event_id,
+               k.user_id AS user_id,
+               k.ts_ms AS ts_ms,
+               k.event_type AS event_type,
+               k.product_id AS product_id,
+               k.price_cents AS price_cents
+        FROM (
+            SELECT event_id,
+                   arg_min(
+                       {{{{
+                           'user_id': user_id,
+                           'ts_ms': ts_ms(ts),
+                           'ingest_ms': ts_ms(ingest_ts),
+                           'event_type': event_type,
+                           'product_id': product_id,
+                           'price_cents':
+                               CASE WHEN event_type = 'purchase' THEN price_val(price_cents) END
+                       }}}},
+                       ts_ms(ingest_ts)
+                   ) AS k
+            FROM ({{parsed}})
+            WHERE event_id IS NOT NULL
+            GROUP BY event_id
+        )
+        WHERE k.user_id IS NOT NULL
+          AND k.product_id IS NOT NULL
+          AND CASE WHEN k.ts_ms >= {window_start} AND k.ts_ms < {window_end}
+                   THEN k.ingest_ms - k.ts_ms <= {_DAY_MS}
+                   ELSE false
+              END
+          AND (
+              k.event_type IN ('view', 'cart')
+              OR (k.event_type = 'purchase' AND k.price_cents IS NOT NULL)
+          )
+    """
+    create_from_csv(con, files, _EVENT_HEADER, statement)
+
+
+def load_clicks(
+    con: duckdb.DuckDBPyConnection, files: list[Path], click_start: int, window_end: int
+) -> None:
+    # Copies of a click hold identical values, so min() just picks that value.
+    statement = f"""
+        CREATE TABLE clicks AS
+        SELECT click_id, user_id, campaign_id, ts_ms
+        FROM (
+            SELECT click_id,
+                   min(user_id) AS user_id,
+                   min(campaign_id) AS campaign_id,
+                   min(ts_ms(ts)) AS ts_ms
+            FROM ({{parsed}})
+            WHERE click_id IS NOT NULL
+            GROUP BY click_id
+        )
+        WHERE user_id IS NOT NULL
+          AND ts_ms >= {click_start} AND ts_ms < {window_end}
+          AND campaign_id IN (SELECT campaign_id FROM campaigns)
+    """
+    create_from_csv(con, files, _CLICK_HEADER, statement)
 
 
 def link_pairs(folder: Path) -> list[tuple[str, str]]:
@@ -310,10 +480,27 @@ def connect() -> duckdb.DuckDBPyConnection:
     con.execute(f"SET temp_directory = '{scratch}/duckdb_tmp'")
     con.execute("SET preserve_insertion_order = false")
     con.execute("SET TimeZone = 'UTC'")
+    for macro in _MACROS:
+        con.execute(macro)
     return con
 
 
-def build(con: duckdb.DuckDBPyConnection) -> None:
+class Stages:
+    """Seconds per stage on stderr, so every run is also a profile."""
+
+    def __init__(self) -> None:
+        self.start = self.last = time.perf_counter()
+
+    def done(self, label: str) -> None:
+        now = time.perf_counter()
+        print(f"stage {now - self.last:8.3f}s  {label}", file=sys.stderr)
+        self.last = now
+
+    def total(self) -> None:
+        print(f"stage {time.perf_counter() - self.start:8.3f}s  total", file=sys.stderr)
+
+
+def build(con: duckdb.DuckDBPyConnection, stages: Stages) -> None:
     con.execute("""
         CREATE TABLE events_p AS
         SELECT coalesce(n.person, e.user_id) AS person,
@@ -326,6 +513,7 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
         LEFT JOIN person_name n ON e.user_id = n.user_id
         LEFT JOIN products p ON e.product_id = p.product_id
     """)
+    stages.done("apply person names to events")
     con.execute("""
         CREATE TABLE clicks_p AS
         SELECT coalesce(n.person, c.user_id) AS person,
@@ -335,6 +523,7 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
         FROM clicks c
         LEFT JOIN person_name n ON c.user_id = n.user_id
     """)
+    stages.done("apply person names to clicks")
     con.execute(f"""
         CREATE TABLE marked AS
         SELECT person, event_id, ts_ms, event_type, category, price_cents,
@@ -348,6 +537,7 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
             FROM events_p
         )
     """)
+    stages.done("sessions: gap flags")
     con.execute("""
         CREATE TABLE in_session AS
         SELECT person, event_id, ts_ms, event_type, category, price_cents,
@@ -358,6 +548,7 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
                ) AS sess_idx
         FROM marked
     """)
+    stages.done("sessions: running index")
     con.execute("""
         CREATE TABLE sessions AS
         SELECT person,
@@ -371,6 +562,7 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
         FROM in_session
         GROUP BY person, sess_idx
     """)
+    stages.done("sessions: aggregate")
     con.execute(f"""
         CREATE TABLE credited AS
         SELECT person, sess_idx, day, session_start, n_events, revenue, n_purchases,
@@ -390,6 +582,7 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
         )
         WHERE rn = 1
     """)
+    stages.done("attribution")
     con.execute(f"""
         CREATE TABLE assisted AS
         SELECT DISTINCT s.person, s.sess_idx, s.day, c.campaign_id
@@ -399,6 +592,7 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
          AND c.ts_ms <= s.session_start
          AND s.session_start - c.ts_ms <= {_WEEK_MS}
     """)
+    stages.done("assists")
     con.execute("""
         CREATE TABLE top_category AS
         SELECT person, day, category AS top_category
@@ -418,6 +612,7 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
         )
         WHERE rn = 1
     """)
+    stages.done("top category")
     con.execute("""
         CREATE TABLE user_daily AS
         SELECT s.person AS user_id,
@@ -430,6 +625,7 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
         LEFT JOIN top_category t ON t.person = s.person AND t.day = s.day
         GROUP BY s.person, s.day, t.top_category
     """)
+    stages.done("user_daily table")
     con.execute("""
         CREATE TABLE campaign_daily AS
         SELECT x.campaign_id,
@@ -465,6 +661,7 @@ def build(con: duckdb.DuckDBPyConnection) -> None:
         ) x
         LEFT JOIN campaigns cam ON cam.campaign_id = x.campaign_id
     """)
+    stages.done("campaign_daily table")
 
 
 def write_table(con: duckdb.DuckDBPyConnection, table: str, columns: str, order_by: str) -> None:
@@ -484,67 +681,35 @@ def write_table(con: duckdb.DuckDBPyConnection, table: str, columns: str, order_
 
 
 def main() -> None:
-    self_check()
+    stages = Stages()
     root = Path(DATA)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     window_start = ts_to_ms(manifest["window_start"])
     window_end = ts_to_ms(manifest["window_end"])
     if window_start is None or window_end is None:
         raise SystemExit("manifest timestamps are not valid F1")
-    products = load_lookup(root / "products.csv")
-    campaigns = load_lookup(root / "campaigns.csv")
-    events = surviving_events(root / "events", window_start, window_end)
-    clicks = surviving_clicks(root / "clicks", window_start - _WEEK_MS, window_end, campaigns)
-    names = person_names(link_pairs(root / "links"))
-    print(
-        f"window {manifest['window_start']} {manifest['window_end']} "
-        f"events {len(events)} clicks {len(clicks)} links {len(names)}",
-        file=sys.stderr,
-    )
     con = connect()
-    insert_rows(
-        con,
-        "events",
-        [
-            ("event_id", "VARCHAR"),
-            ("user_id", "VARCHAR"),
-            ("ts_ms", "BIGINT"),
-            ("event_type", "VARCHAR"),
-            ("product_id", "VARCHAR"),
-            ("price_cents", "BIGINT"),
-        ],
-        events,
-    )
-    insert_rows(
-        con,
-        "clicks",
-        [
-            ("click_id", "VARCHAR"),
-            ("user_id", "VARCHAR"),
-            ("campaign_id", "VARCHAR"),
-            ("ts_ms", "BIGINT"),
-        ],
-        clicks,
-    )
+    self_check(con)
+    stages.done("startup and self-check")
+    load_lookup(con, "products", root / "products.csv", "product_id", "category")
+    load_lookup(con, "campaigns", root / "campaigns.csv", "campaign_id", "channel")
+    stages.done("products and campaigns")
+    load_events(con, csv_files(root / "events"), window_start, window_end)
+    stages.done("events: parse, dedup, validate")
+    load_clicks(con, csv_files(root / "clicks"), window_start - _WEEK_MS, window_end)
+    stages.done("clicks: parse, dedup, validate")
+    pairs = link_pairs(root / "links")
+    stages.done("links: parse")
+    names = person_names(pairs)
+    stages.done("id linking: union-find")
     insert_rows(
         con,
         "person_name",
         [("user_id", "VARCHAR"), ("person", "VARCHAR")],
         names,
     )
-    insert_rows(
-        con,
-        "products",
-        [("product_id", "VARCHAR"), ("category", "VARCHAR")],
-        list(products.items()),
-    )
-    insert_rows(
-        con,
-        "campaigns",
-        [("campaign_id", "VARCHAR"), ("channel", "VARCHAR")],
-        list(campaigns.items()),
-    )
-    build(con)
+    stages.done("id linking: insert names")
+    build(con, stages)
     write_table(
         con,
         "user_daily",
@@ -558,7 +723,17 @@ def main() -> None:
         "revenue_cents, assisted_sessions",
         "campaign_id, day",
     )
+    stages.done("write parquet")
+    counts = con.execute(
+        "SELECT (SELECT count(*) FROM events), (SELECT count(*) FROM clicks)"
+    ).fetchone()
     con.close()
+    print(
+        f"window {manifest['window_start']} {manifest['window_end']} "
+        f"events {counts[0]} clicks {counts[1]} links {len(names)}",
+        file=sys.stderr,
+    )
+    stages.total()
 
 
 if __name__ == "__main__":

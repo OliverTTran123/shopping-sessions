@@ -1,2 +1,3 @@
 ts	id	hypothesis	change	before	after	verdict	note
 2026-11-21T18:08:00Z	1	Single-thread ordered Parquet copy makes runs byte-identical	write_table sets threads=1 and ORDER BY the daily key	determinism DIFFERENT	identical score 0 median 468s	kept	bench median 468s exceeds local 300s limit; no speed change
+2026-11-21T20:31:30Z	2	Python row parsing and chunked unnest INSERTs are row-at-a-time; read_csv parses on all threads	events, clicks and lookups parsed, deduped and validated in SQL over read_csv; text reader when a carriage return is present	448s (insert 581s of a 634s profiled run)	54.8s score 0 same bytes	kept	events 0.95s clicks 0.12s; left: attribution 44s, name insert 8s
