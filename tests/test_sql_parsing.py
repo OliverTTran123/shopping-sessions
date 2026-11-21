@@ -95,6 +95,37 @@ def test_carriage_return_stays_in_its_field(tmp_path, body):
     assert "\n".join(line for (line,) in lines) == body.removesuffix("\n")
 
 
+def test_components_names_each_group_by_its_smallest_node():
+    rng = random.Random(11)
+    count = 3000
+    # Long chains in random order, stars, repeats, and nodes with no edge at all.
+    order = list(range(count))
+    rng.shuffle(order)
+    edges = [(order[i], order[i + 1]) for i in range(0, 1200) if i % 400 != 399]
+    edges += [(order[1500], order[i]) for i in range(1501, 1700)]
+    edges += [(rng.randrange(2000, 2600), rng.randrange(2000, 2600)) for _ in range(250)]
+    edges += [(b, a) for a, b in edges[::7]]
+    rng.shuffle(edges)
+    parent = list(range(count))
+
+    def find(node):
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for a, b in edges:
+        parent[find(a)] = find(b)
+    smallest = {}
+    for node in range(count):
+        smallest[find(node)] = min(smallest.get(find(node), node), node)
+    want = [smallest[find(node)] for node in range(count)]
+    left = p.np.array([a for a, _ in edges], dtype=p.np.int64)
+    right = p.np.array([b for _, b in edges], dtype=p.np.int64)
+    assert p.components(count, left, right).tolist() == want
+    assert p.components(4, left[:0], right[:0]).tolist() == [0, 1, 2, 3]
+
+
 def test_odd_header_takes_the_text_reader(tmp_path):
     (tmp_path / "a.csv").write_bytes(b"x\r\nk1,u1,c_1,5\n")
     assert not p.plain_headers(p.csv_files(tmp_path), HEADER)

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Shopping Sessions pipeline. rules.md wins over the starter skeleton.
 
-DuckDB reads the files as raw text and applies the CSV dialect, dedup and
-validation in SQL, then sessionizes, attributes, and aggregates. Linked-id names
-still come from a Python union-find.
+DuckDB reads the files and applies the CSV dialect, dedup and validation in SQL,
+then sessionizes, attributes, and aggregates. Linked IDs are joined by a union-find
+over numpy edge arrays.
 """
 
 import json
@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 import duckdb
+import numpy as np
 
 DATA = os.environ.get("DATA_DIR", "/data")
 OUT = os.environ.get("OUTPUT_DIR", "/output")
@@ -177,67 +178,6 @@ def self_check(con: duckdb.DuckDBPyConnection) -> None:
     assert got == want, got
 
 
-def parse_fields(line: str, width: int) -> list[str | None] | None:
-    """CSV dialect from rules.md. None means the whole line is malformed."""
-    parts = line.split(",")
-    if len(parts) != width:
-        return None
-    values: list[str | None] = []
-    for field in parts:
-        if field == "" or field == '""':
-            values.append(None)
-            continue
-        if field.startswith('"'):
-            if len(field) < 2 or not field.endswith('"') or '"' in field[1:-1]:
-                return None
-            values.append(field[1:-1])
-            continue
-        if '"' in field:
-            return None
-        values.append(field)
-    return values
-
-
-def data_lines(folder: Path) -> list[str]:
-    lines: list[str] = []
-    for path in sorted(folder.glob("*.csv")):
-        parts = path.read_bytes().decode("utf-8").split("\n")
-        lines.extend(line for line in parts[1:] if line != "")
-    return lines
-
-
-def person_names(pairs: list[tuple[str, str]]) -> list[tuple[str, str]]:
-    parent: dict[str, str] = {}
-
-    def find(node: str) -> str:
-        parent.setdefault(node, node)
-        root = node
-        while parent[root] != root:
-            root = parent[root]
-        while parent[node] != root:
-            parent[node], node = root, parent[node]
-        return root
-
-    def union(left: str, right: str) -> None:
-        ra, rb = find(left), find(right)
-        if ra != rb:
-            parent[rb] = ra
-
-    for left, right in pairs:
-        if left == right:
-            find(left)
-        else:
-            union(left, right)
-    groups: dict[str, list[str]] = {}
-    for node in list(parent):
-        groups.setdefault(find(node), []).append(node)
-    rows: list[tuple[str, str]] = []
-    for members in groups.values():
-        name = min(members)
-        rows.extend((member, name) for member in members)
-    return rows
-
-
 _CLOCK = (
     "[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
 )
@@ -287,6 +227,7 @@ _MACROS = (
 )
 _EVENT_HEADER = "event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents"
 _CLICK_HEADER = "click_id,user_id,campaign_id,ts"
+_LINK_HEADER = "user_id_a,user_id_b"
 
 
 def csv_files(folder: Path) -> list[Path]:
@@ -434,32 +375,63 @@ def load_clicks(
     create_from_csv(con, files, _CLICK_HEADER, statement)
 
 
-def link_pairs(folder: Path) -> list[tuple[str, str]]:
-    pairs: list[tuple[str, str]] = []
-    for line in data_lines(folder):
-        fields = parse_fields(line, 2)
-        if fields is None or fields[0] is None or fields[1] is None:
-            continue
-        pairs.append((fields[0], fields[1]))
-    return pairs
+def components(count: int, left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """The smallest node of every node's connected component; edges join left[i] and right[i].
+
+    Union-find over whole arrays: each round hangs every root that an edge joins to a
+    smaller root under that root, then points every node at its root again. A label only
+    ever decreases, so a component ends at its smallest node whichever edge wrote last.
+    """
+    label = np.arange(count, dtype=np.int64)
+    while len(left):
+        low = np.minimum(label[left], label[right])
+        high = np.maximum(label[left], label[right])
+        open_edges = low != high
+        if not open_edges.any():
+            break
+        label[high[open_edges]] = low[open_edges]
+        while True:
+            parent = label[label]
+            if np.array_equal(parent, label):
+                break
+            label = parent
+        left, right = left[open_edges], right[open_edges]
+    return label
 
 
-def insert_rows(
-    con: duckdb.DuckDBPyConnection,
-    table: str,
-    columns: list[tuple[str, str]],
-    rows: list[tuple],
-) -> None:
-    decls = ", ".join(f"{name} {kind}" for name, kind in columns)
-    con.execute(f"CREATE TABLE {table} ({decls})")
-    if not rows:
-        return
-    select = ", ".join(f"unnest(?)::{kind} AS {name}" for name, kind in columns)
-    step = 100_000
-    for start in range(0, len(rows), step):
-        chunk = rows[start : start + step]
-        payload = [list(column) for column in zip(*chunk, strict=True)]
-        con.execute(f"INSERT INTO {table} SELECT {select}", payload)
+def load_person_names(con: duckdb.DuckDBPyConnection, files: list[Path]) -> None:
+    """person_name(user_id, person) for every linked ID whose person has another name."""
+    statement = """
+        CREATE TABLE link_pairs AS
+        SELECT user_id_a AS a, user_id_b AS b
+        FROM ({parsed})
+        WHERE user_id_a IS NOT NULL AND user_id_b IS NOT NULL AND user_id_a <> user_id_b
+    """
+    create_from_csv(con, files, _LINK_HEADER, statement)
+    # Codes follow the byte order of the IDs, so the smallest code of a person is its name.
+    con.execute("""
+        CREATE TABLE link_ids AS
+        SELECT id, row_number() OVER (ORDER BY id) - 1 AS code
+        FROM (SELECT a AS id FROM link_pairs UNION SELECT b FROM link_pairs)
+    """)
+    edges = con.execute("""
+        SELECT x.code AS a, y.code AS b
+        FROM link_pairs p
+        JOIN link_ids x ON x.id = p.a
+        JOIN link_ids y ON y.id = p.b
+    """).fetchnumpy()
+    count = con.execute("SELECT count(*) FROM link_ids").fetchone()[0]
+    root = components(count, edges["a"].astype(np.int64), edges["b"].astype(np.int64))
+    renamed = np.flatnonzero(root != np.arange(count, dtype=np.int64))
+    con.register("renamed_codes", {"code": renamed, "root": root[renamed]})
+    con.execute("""
+        CREATE TABLE person_name AS
+        SELECT i.id AS user_id, r.id AS person
+        FROM renamed_codes n
+        JOIN link_ids i ON i.code = n.code
+        JOIN link_ids r ON r.code = n.root
+    """)
+    con.unregister("renamed_codes")
 
 
 def scratch_dir() -> str:
@@ -698,17 +670,8 @@ def main() -> None:
     stages.done("events: parse, dedup, validate")
     load_clicks(con, csv_files(root / "clicks"), window_start - _WEEK_MS, window_end)
     stages.done("clicks: parse, dedup, validate")
-    pairs = link_pairs(root / "links")
-    stages.done("links: parse")
-    names = person_names(pairs)
-    stages.done("id linking: union-find")
-    insert_rows(
-        con,
-        "person_name",
-        [("user_id", "VARCHAR"), ("person", "VARCHAR")],
-        names,
-    )
-    stages.done("id linking: insert names")
+    load_person_names(con, csv_files(root / "links"))
+    stages.done("id linking: parse, components, names")
     build(con, stages)
     write_table(
         con,
@@ -725,12 +688,13 @@ def main() -> None:
     )
     stages.done("write parquet")
     counts = con.execute(
-        "SELECT (SELECT count(*) FROM events), (SELECT count(*) FROM clicks)"
+        "SELECT (SELECT count(*) FROM events), (SELECT count(*) FROM clicks), "
+        "(SELECT count(*) FROM link_ids)"
     ).fetchone()
     con.close()
     print(
         f"window {manifest['window_start']} {manifest['window_end']} "
-        f"events {counts[0]} clicks {counts[1]} links {len(names)}",
+        f"events {counts[0]} clicks {counts[1]} linked ids {counts[2]}",
         file=sys.stderr,
     )
     stages.total()
