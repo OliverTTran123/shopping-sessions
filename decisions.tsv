@@ -1,1 +1,2 @@
 ts	id	hypothesis	change	before	after	verdict	note
+2026-11-21T18:08:00Z	1	Single-thread ordered Parquet copy makes runs byte-identical	write_table sets threads=1 and ORDER BY the daily key	determinism DIFFERENT	identical score 0 median 468s	kept	bench median 468s exceeds local 300s limit; no speed change

@@ -1,29 +1,49 @@
-"""Local scorer. Replace the body of `score` with the track's published scoring rule.
+"""Local gate for Shopping Sessions.
 
-It must print one JSON object on stdout with at least a numeric "score" key.
-Extra keys (for example "n" and "errors") are shown in the CHECK line.
-Once it is correct, run `make freeze` so no agent can change it.
+The published score is container run time in seconds, and lower is better. A wrong
+table is not scored. This checks the two output tables against the dev answer and
+sets "score" to the number of differing rows, so 0 means an exact match.
 """
 
 import argparse
 import json
+import sys
+from pathlib import Path
+
+_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+sys.path.insert(0, str(_SCRIPTS))
+
+from compare import load  # noqa: E402
+from run_fixtures import SCHEMAS  # noqa: E402
 
 
-def score(pred: object, truth: object) -> dict:
-    raise NotImplementedError("Implement the track's scoring rule here.")
+def score(pred: Path, truth: Path) -> dict:
+    diff_rows = 0
+    details: dict[str, int] = {}
+    for table, schema in SCHEMAS.items():
+        actual, expected = load(pred, table), load(truth, table)
+        keys = [column for column in ("user_id", "campaign_id", "day") if column in schema]
+        duplicate_pred = actual.height - actual.n_unique(subset=keys)
+        duplicate_truth = expected.height - expected.n_unique(subset=keys)
+        only_pred = actual.join(expected, on=list(schema), how="anti", nulls_equal=True).height
+        only_truth = expected.join(actual, on=list(schema), how="anti", nulls_equal=True).height
+        table_diff = only_pred + only_truth + duplicate_pred + duplicate_truth
+        diff_rows += table_diff
+        details[f"{table}_diff"] = table_diff
+    return {"score": diff_rows, **details}
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pred", required=True)
+    parser.add_argument(
+        "--pred", required=True, help="output directory, or a folder of csv answers"
+    )
     parser.add_argument("--truth", required=True)
     args = parser.parse_args()
-    with open(args.pred) as f:
-        pred = json.load(f)
-    with open(args.truth) as f:
-        truth = json.load(f)
-    print(json.dumps(score(pred, truth)))
+    result = score(Path(args.pred), Path(args.truth))
+    print(json.dumps(result))
+    return 0 if result["score"] == 0 else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
