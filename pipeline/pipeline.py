@@ -9,6 +9,7 @@ over numpy edge arrays.
 import json
 import os
 import re
+import resource
 import sys
 import tempfile
 import time
@@ -469,7 +470,11 @@ class Stages:
         self.last = now
 
     def total(self) -> None:
-        print(f"stage {time.perf_counter() - self.start:8.3f}s  total", file=sys.stderr)
+        peak_mib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+        print(
+            f"stage {time.perf_counter() - self.start:8.3f}s  total, peak rss {peak_mib} MiB",
+            file=sys.stderr,
+        )
 
 
 def build(con: duckdb.DuckDBPyConnection, stages: Stages) -> None:
