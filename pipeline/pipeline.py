@@ -563,24 +563,24 @@ def build(con: duckdb.DuckDBPyConnection, stages: Stages) -> None:
         GROUP BY person, sess_idx
     """)
     stages.done("sessions: aggregate")
+    # The person's latest click at or before the session start is the only candidate:
+    # if it is over 7 days old, so is every earlier one. Clicks at one millisecond are
+    # reduced to the smallest click_id first, so the ASOF match is unique.
     con.execute(f"""
         CREATE TABLE credited AS
-        SELECT person, sess_idx, day, session_start, n_events, revenue, n_purchases,
-               coalesce(campaign_id, 'organic') AS campaign_id
-        FROM (
-            SELECT s.person, s.sess_idx, s.day, s.session_start, s.n_events, s.revenue,
-                   s.n_purchases, c.campaign_id, c.click_id,
-                   row_number() OVER (
-                       PARTITION BY s.person, s.sess_idx
-                       ORDER BY (c.click_id IS NULL), c.ts_ms DESC, c.click_id
-                   ) AS rn
-            FROM sessions s
-            LEFT JOIN clicks_p c
-              ON c.person = s.person
-             AND c.ts_ms <= s.session_start
-             AND s.session_start - c.ts_ms <= {_WEEK_MS}
-        )
-        WHERE rn = 1
+        SELECT s.person, s.sess_idx, s.day, s.session_start, s.n_events, s.revenue,
+               s.n_purchases,
+               CASE WHEN s.session_start - c.ts_ms <= {_WEEK_MS}
+                    THEN c.campaign_id
+                    ELSE 'organic'
+               END AS campaign_id
+        FROM sessions s
+        ASOF LEFT JOIN (
+            SELECT person, ts_ms, arg_min(campaign_id, click_id) AS campaign_id
+            FROM clicks_p
+            GROUP BY person, ts_ms
+        ) c
+          ON s.person = c.person AND s.session_start >= c.ts_ms
     """)
     stages.done("attribution")
     con.execute(f"""
