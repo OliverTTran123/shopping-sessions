@@ -312,43 +312,56 @@ def load_lookup(con: duckdb.DuckDBPyConnection, table: str, path: Path, key: str
 def load_events(
     con: duckdb.DuckDBPyConnection, files: list[Path], window_start: int, window_end: int
 ) -> None:
+    """events(person, ts_ms, price_cents, category): the surviving events, by person.
+
+    A surviving event's own ID, type and product are never read again: price_cents is
+    set for purchases only, and so is category.
+    """
     # Dedup first: the copy with the smallest ingest_ts is kept even if it is invalid.
     statement = f"""
         CREATE TABLE events AS
-        SELECT event_id,
-               k.user_id AS user_id,
-               k.ts_ms AS ts_ms,
-               k.event_type AS event_type,
-               k.product_id AS product_id,
-               k.price_cents AS price_cents
+        SELECT coalesce(n.person, e.user_id) AS person,
+               e.ts_ms,
+               e.price_cents,
+               CASE WHEN e.price_cents IS NOT NULL THEN coalesce(p.category, 'unknown') END
+                   AS category
         FROM (
-            SELECT event_id,
-                   arg_min(
-                       {{{{
-                           'user_id': user_id,
-                           'ts_ms': ts_ms(ts),
-                           'ingest_ms': ts_ms(ingest_ts),
-                           'event_type': event_type,
-                           'product_id': product_id,
-                           'price_cents':
-                               CASE WHEN event_type = 'purchase' THEN price_val(price_cents) END
-                       }}}},
-                       ts_ms(ingest_ts)
-                   ) AS k
-            FROM ({{parsed}})
-            WHERE event_id IS NOT NULL
-            GROUP BY event_id
-        )
-        WHERE k.user_id IS NOT NULL
-          AND k.product_id IS NOT NULL
-          AND CASE WHEN k.ts_ms >= {window_start} AND k.ts_ms < {window_end}
-                   THEN k.ingest_ms - k.ts_ms <= {_DAY_MS}
-                   ELSE false
-              END
-          AND (
-              k.event_type IN ('view', 'cart')
-              OR (k.event_type = 'purchase' AND k.price_cents IS NOT NULL)
-          )
+            SELECT k.user_id AS user_id,
+                   k.ts_ms AS ts_ms,
+                   k.product_id AS product_id,
+                   k.price_cents AS price_cents
+            FROM (
+                SELECT arg_min(
+                           {{{{
+                               'user_id': user_id,
+                               'ts_ms': ts_ms(ts),
+                               'ingest_ms': ts_ms(ingest_ts),
+                               'event_type': event_type,
+                               'product_id': product_id,
+                               'price_cents':
+                                   CASE WHEN event_type = 'purchase'
+                                        THEN price_val(price_cents)
+                                   END
+                           }}}},
+                           ts_ms(ingest_ts)
+                       ) AS k
+                FROM ({{parsed}})
+                WHERE event_id IS NOT NULL
+                GROUP BY event_id
+            )
+            WHERE k.user_id IS NOT NULL
+              AND k.product_id IS NOT NULL
+              AND CASE WHEN k.ts_ms >= {window_start} AND k.ts_ms < {window_end}
+                       THEN k.ingest_ms - k.ts_ms <= {_DAY_MS}
+                       ELSE false
+                  END
+              AND (
+                  k.event_type IN ('view', 'cart')
+                  OR (k.event_type = 'purchase' AND k.price_cents IS NOT NULL)
+              )
+        ) e
+        LEFT JOIN person_name n ON n.user_id = e.user_id
+        LEFT JOIN products p ON p.product_id = e.product_id
     """
     create_from_csv(con, files, _EVENT_HEADER, statement)
 
@@ -356,22 +369,27 @@ def load_events(
 def load_clicks(
     con: duckdb.DuckDBPyConnection, files: list[Path], click_start: int, window_end: int
 ) -> None:
+    """clicks(person, click_id, campaign_id, ts_ms): the valid clicks, by person."""
     # Copies of a click hold identical values, so min() just picks that value.
     statement = f"""
         CREATE TABLE clicks AS
-        SELECT click_id, user_id, campaign_id, ts_ms
+        SELECT coalesce(n.person, c.user_id) AS person, c.click_id, c.campaign_id, c.ts_ms
         FROM (
-            SELECT click_id,
-                   min(user_id) AS user_id,
-                   min(campaign_id) AS campaign_id,
-                   min(ts_ms(ts)) AS ts_ms
-            FROM ({{parsed}})
-            WHERE click_id IS NOT NULL
-            GROUP BY click_id
-        )
-        WHERE user_id IS NOT NULL
-          AND ts_ms >= {click_start} AND ts_ms < {window_end}
-          AND campaign_id IN (SELECT campaign_id FROM campaigns)
+            SELECT click_id, user_id, campaign_id, ts_ms
+            FROM (
+                SELECT click_id,
+                       min(user_id) AS user_id,
+                       min(campaign_id) AS campaign_id,
+                       min(ts_ms(ts)) AS ts_ms
+                FROM ({{parsed}})
+                WHERE click_id IS NOT NULL
+                GROUP BY click_id
+            )
+            WHERE user_id IS NOT NULL
+              AND ts_ms >= {click_start} AND ts_ms < {window_end}
+              AND campaign_id IN (SELECT campaign_id FROM campaigns)
+        ) c
+        LEFT JOIN person_name n ON n.user_id = c.user_id
     """
     create_from_csv(con, files, _CLICK_HEADER, statement)
 
@@ -400,8 +418,11 @@ def components(count: int, left: np.ndarray, right: np.ndarray) -> np.ndarray:
     return label
 
 
-def load_person_names(con: duckdb.DuckDBPyConnection, files: list[Path]) -> None:
-    """person_name(user_id, person) for every linked ID whose person has another name."""
+def load_person_names(con: duckdb.DuckDBPyConnection, files: list[Path]) -> int:
+    """person_name(user_id, person) for every linked ID whose person has another name.
+
+    Returns how many distinct IDs the links name.
+    """
     statement = """
         CREATE TABLE link_pairs AS
         SELECT user_id_a AS a, user_id_b AS b
@@ -433,6 +454,9 @@ def load_person_names(con: duckdb.DuckDBPyConnection, files: list[Path]) -> None
         JOIN link_ids r ON r.code = n.root
     """)
     con.unregister("renamed_codes")
+    con.execute("DROP TABLE link_pairs")
+    con.execute("DROP TABLE link_ids")
+    return count
 
 
 def scratch_dir() -> str:
@@ -478,97 +502,90 @@ class Stages:
 
 
 def build(con: duckdb.DuckDBPyConnection, stages: Stages) -> None:
-    con.execute("""
-        CREATE TABLE events_p AS
-        SELECT coalesce(n.person, e.user_id) AS person,
-               e.event_id,
-               e.ts_ms,
-               e.event_type,
-               coalesce(p.category, 'unknown') AS category,
-               e.price_cents
-        FROM events e
-        LEFT JOIN person_name n ON e.user_id = n.user_id
-        LEFT JOIN products p ON e.product_id = p.product_id
-    """)
-    stages.done("apply person names to events")
-    con.execute("""
-        CREATE TABLE clicks_p AS
-        SELECT coalesce(n.person, c.user_id) AS person,
-               c.click_id,
-               c.campaign_id,
-               c.ts_ms
-        FROM clicks c
-        LEFT JOIN person_name n ON c.user_id = n.user_id
-    """)
-    stages.done("apply person names to clicks")
+    """Sessions, attribution, assists and the two daily tables.
+
+    Every statement reads tables and writes one; nothing that only feeds the next
+    statement is stored, and a table is dropped after its last reader.
+    """
+    # A gap is measured between distinct timestamps. Events at one millisecond are peers
+    # in both windows: one of them carries the break, and the RANGE frame gives all of
+    # them the same running count, so the order among them never matters.
     con.execute(f"""
-        CREATE TABLE marked AS
-        SELECT person, event_id, ts_ms, event_type, category, price_cents,
-               CASE
-                   WHEN prev_ts IS NULL OR ts_ms - prev_ts > {_GAP_MS} THEN 1
-                   ELSE 0
-               END AS brk
-        FROM (
-            SELECT *,
-                   lag(ts_ms) OVER (PARTITION BY person ORDER BY ts_ms, event_id) AS prev_ts
-            FROM events_p
-        )
-    """)
-    stages.done("sessions: gap flags")
-    con.execute("""
-        CREATE TABLE in_session AS
-        SELECT person, event_id, ts_ms, event_type, category, price_cents,
-               sum(brk) OVER (
-                   PARTITION BY person
-                   ORDER BY ts_ms, event_id
-                   ROWS UNBOUNDED PRECEDING
-               ) AS sess_idx
-        FROM marked
-    """)
-    stages.done("sessions: running index")
-    con.execute("""
         CREATE TABLE sessions AS
         SELECT person,
-               sess_idx,
                min(ts_ms) AS session_start,
                DATE '1970-01-01'
                    + CAST(min(ts_ms) // 86400000 AS INTEGER) AS day,
                count(*) AS n_events,
                coalesce(sum(price_cents), 0) AS revenue,
-               count(price_cents) AS n_purchases
-        FROM in_session
+               count(price_cents) AS n_purchases,
+               list({{'category': category, 'price_cents': price_cents}})
+                   FILTER (WHERE price_cents IS NOT NULL) AS purchases
+        FROM (
+            SELECT person, ts_ms, price_cents, category,
+                   sum(brk) OVER (
+                       PARTITION BY person
+                       ORDER BY ts_ms
+                       RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                   ) AS sess_idx
+            FROM (
+                SELECT person, ts_ms, price_cents, category,
+                       CASE
+                           WHEN prev_ts IS NULL OR ts_ms - prev_ts > {_GAP_MS} THEN 1
+                           ELSE 0
+                       END AS brk
+                FROM (
+                    SELECT *,
+                           lag(ts_ms) OVER (PARTITION BY person ORDER BY ts_ms) AS prev_ts
+                    FROM events
+                )
+            )
+        )
         GROUP BY person, sess_idx
     """)
-    stages.done("sessions: aggregate")
+    con.execute("DROP TABLE events")
+    stages.done("sessions")
     # The person's latest click at or before the session start is the only candidate:
     # if it is over 7 days old, so is every earlier one. Clicks at one millisecond are
     # reduced to the smallest click_id first, so the ASOF match is unique.
     con.execute(f"""
-        CREATE TABLE credited AS
-        SELECT s.person, s.sess_idx, s.day, s.session_start, s.n_events, s.revenue,
-               s.n_purchases,
-               CASE WHEN s.session_start - c.ts_ms <= {_WEEK_MS}
-                    THEN c.campaign_id
-                    ELSE 'organic'
-               END AS campaign_id
-        FROM sessions s
-        ASOF LEFT JOIN (
-            SELECT person, ts_ms, arg_min(campaign_id, click_id) AS campaign_id
-            FROM clicks_p
-            GROUP BY person, ts_ms
-        ) c
-          ON s.person = c.person AND s.session_start >= c.ts_ms
+        CREATE TABLE credited_daily AS
+        SELECT campaign_id, day,
+               count(*)::BIGINT AS sessions,
+               count(*) FILTER (WHERE n_purchases > 0)::BIGINT AS purchasing_sessions,
+               sum(revenue)::BIGINT AS revenue_cents
+        FROM (
+            SELECT s.day, s.revenue, s.n_purchases,
+                   CASE WHEN s.session_start - c.ts_ms <= {_WEEK_MS}
+                        THEN c.campaign_id
+                        ELSE 'organic'
+                   END AS campaign_id
+            FROM sessions s
+            ASOF LEFT JOIN (
+                SELECT person, ts_ms, arg_min(campaign_id, click_id) AS campaign_id
+                FROM clicks
+                GROUP BY person, ts_ms
+            ) c
+              ON s.person = c.person AND s.session_start >= c.ts_ms
+        )
+        GROUP BY campaign_id, day
     """)
     stages.done("attribution")
+    # A session's row number stands for the session, so each campaign counts it once.
     con.execute(f"""
-        CREATE TABLE assisted AS
-        SELECT DISTINCT s.person, s.sess_idx, s.day, c.campaign_id
-        FROM sessions s
-        JOIN clicks_p c
-          ON c.person = s.person
-         AND c.ts_ms <= s.session_start
-         AND s.session_start - c.ts_ms <= {_WEEK_MS}
+        CREATE TABLE assisted_daily AS
+        SELECT campaign_id, day, count(*)::BIGINT AS assisted_sessions
+        FROM (
+            SELECT DISTINCT s.rowid AS session_row, s.day, c.campaign_id
+            FROM sessions s
+            JOIN clicks c
+              ON c.person = s.person
+             AND c.ts_ms <= s.session_start
+             AND s.session_start - c.ts_ms <= {_WEEK_MS}
+        )
+        GROUP BY campaign_id, day
     """)
+    con.execute("DROP TABLE clicks")
     stages.done("assists")
     con.execute("""
         CREATE TABLE top_category AS
@@ -580,11 +597,14 @@ def build(con: duckdb.DuckDBPyConnection, stages: Stages) -> None:
                        ORDER BY rev DESC, category
                    ) AS rn
             FROM (
-                SELECT s.person, s.day, e.category, sum(e.price_cents) AS rev
-                FROM in_session e
-                JOIN sessions s ON s.person = e.person AND s.sess_idx = e.sess_idx
-                WHERE e.event_type = 'purchase'
-                GROUP BY s.person, s.day, e.category
+                SELECT person, day, bought.category AS category,
+                       sum(bought.price_cents) AS rev
+                FROM (
+                    SELECT person, day, unnest(purchases) AS bought
+                    FROM sessions
+                    WHERE purchases IS NOT NULL
+                )
+                GROUP BY person, day, bought.category
             )
         )
         WHERE rn = 1
@@ -602,6 +622,8 @@ def build(con: duckdb.DuckDBPyConnection, stages: Stages) -> None:
         LEFT JOIN top_category t ON t.person = s.person AND t.day = s.day
         GROUP BY s.person, s.day, t.top_category
     """)
+    con.execute("DROP TABLE sessions")
+    con.execute("DROP TABLE top_category")
     stages.done("user_daily table")
     con.execute("""
         CREATE TABLE campaign_daily AS
@@ -622,19 +644,8 @@ def build(con: duckdb.DuckDBPyConnection, stages: Stages) -> None:
                        WHEN coalesce(c.campaign_id, a.campaign_id) = 'organic' THEN 0
                        ELSE coalesce(a.assisted_sessions, 0)
                    END::BIGINT AS assisted_sessions
-            FROM (
-                SELECT campaign_id, day,
-                       count(*)::BIGINT AS sessions,
-                       count(*) FILTER (WHERE n_purchases > 0)::BIGINT AS purchasing_sessions,
-                       sum(revenue)::BIGINT AS revenue_cents
-                FROM credited
-                GROUP BY campaign_id, day
-            ) c
-            FULL OUTER JOIN (
-                SELECT campaign_id, day, count(*)::BIGINT AS assisted_sessions
-                FROM assisted
-                GROUP BY campaign_id, day
-            ) a USING (campaign_id, day)
+            FROM credited_daily c
+            FULL OUTER JOIN assisted_daily a USING (campaign_id, day)
         ) x
         LEFT JOIN campaigns cam ON cam.campaign_id = x.campaign_id
     """)
@@ -671,12 +682,17 @@ def main() -> None:
     load_lookup(con, "products", root / "products.csv", "product_id", "category")
     load_lookup(con, "campaigns", root / "campaigns.csv", "campaign_id", "channel")
     stages.done("products and campaigns")
-    load_events(con, csv_files(root / "events"), window_start, window_end)
-    stages.done("events: parse, dedup, validate")
-    load_clicks(con, csv_files(root / "clicks"), window_start - _WEEK_MS, window_end)
-    stages.done("clicks: parse, dedup, validate")
-    load_person_names(con, csv_files(root / "links"))
+    linked = load_person_names(con, csv_files(root / "links"))
     stages.done("id linking: parse, components, names")
+    load_events(con, csv_files(root / "events"), window_start, window_end)
+    stages.done("events: parse, dedup, validate, name")
+    load_clicks(con, csv_files(root / "clicks"), window_start - _WEEK_MS, window_end)
+    con.execute("DROP TABLE person_name")
+    con.execute("DROP TABLE products")
+    stages.done("clicks: parse, dedup, validate, name")
+    counts = con.execute(
+        "SELECT (SELECT count(*) FROM events), (SELECT count(*) FROM clicks)"
+    ).fetchone()
     build(con, stages)
     write_table(
         con,
@@ -692,14 +708,10 @@ def main() -> None:
         "campaign_id, day",
     )
     stages.done("write parquet")
-    counts = con.execute(
-        "SELECT (SELECT count(*) FROM events), (SELECT count(*) FROM clicks), "
-        "(SELECT count(*) FROM link_ids)"
-    ).fetchone()
     con.close()
     print(
         f"window {manifest['window_start']} {manifest['window_end']} "
-        f"events {counts[0]} clicks {counts[1]} linked ids {counts[2]}",
+        f"events {counts[0]} clicks {counts[1]} linked ids {linked}",
         file=sys.stderr,
     )
     stages.total()
