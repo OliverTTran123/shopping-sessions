@@ -1,15 +1,16 @@
 # Fill in RUN, SCORE and LIMIT_S once the kit is out. Everything else works as is.
 PY      ?= python3
 # All data lives on WSL ext4, never in the repo or under /mnt/c. Override via env vars.
-DATA_DIR    ?= $(HOME)/ss-data/input
+# The dev set, its answer and the generator are the v5 ones (scorer shopping-sessions-5).
+DATA_DIR    ?= $(HOME)/ss-data/input-v5
 OUT_DIR     ?= $(HOME)/ss-data/output
 SCRATCH_DIR ?= $(HOME)/ss-data/scratch
 IMAGE       ?= shopping-sessions:latest
 CPUS        ?= 8
 MEM         ?= 8g
 PLATFORM    ?= linux/amd64
-ANSWER      ?= $(HOME)/ss-data/downloads/dev-answer
-GENERATE    ?= $(HOME)/.cargo/bin/generate
+ANSWER      ?= $(HOME)/ss-data/downloads/v5/dev-answer
+GENERATE    ?= $(HOME)/.cargo/bin/generate-v5
 export DATA_DIR OUT_DIR SCRATCH_DIR IMAGE CPUS MEM PLATFORM
 # Starter dev-check: run the image on the dev set, then exact-diff both tables.
 RUN     ?= sh scripts/docker_run.sh $(DATA_DIR) $(OUT_DIR)
